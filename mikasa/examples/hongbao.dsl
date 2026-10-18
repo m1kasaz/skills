@@ -1,0 +1,378 @@
+case: 抢红包系统
+
+prose: |
+  除夕级别的瞬时洪峰 + 金额不能错——整个设计就是围着「把拒绝做得便宜、把扣减做得原子」这两件事转的。
+
+comp 用户 [client]:
+  note: |
+    前端只发一次请求，按钮置灰防连点；重试带同一个 request_id：
+    ```
+    btn.onclick = () => {
+      btn.disabled = true
+      POST /grab { red_packet_id, request_id: uuid() }  // 重试复用同一 id
+    }
+    ```
+
+comp 网关 [gateway] @接入层:
+  api: |
+    POST /grab
+    in:  { red_packet_id, user_id, request_id }
+    out: { amount: 3.21 } | { code: "EMPTY" } | { code: "GRABBED" }
+  logic: |
+    // 入口限流的完整实现——令牌桶：
+    // 想象一个装门票的桶，最多攒 4000 张；后台有个协程每秒往桶里补 2000 张。
+    // 每个请求进来先从桶里拿一张票：拿得到就放行，拿不到当场拒绝。
+    // 关键在于「拒绝」的成本只是一次内存读取，被拒的请求不排队、不占任何资源。
+    bucket := NewTokenBucket(cap=4000, refill=2000/s)
+    func GrabHandler(w, req):
+        if !bucket.Take():                // 桶空了：洪峰超出 2000/s 的部分
+            return 429 "人太多，稍后再试"  // 立刻拒，这批请求牺牲掉保全局
+        if userQPS(req.user_id) > 10:     // 单用户每秒最多 10 次，防脚本刷单
+            return 429 "操作太频繁"
+        ...校验通过，转发给红包服务
+    // 2000/s 这个数字不是拍的：红包服务单机压测稳扛 2000 QPS，
+    // 网关集群按实例数把总额度分摊到每台机器的本地桶里。
+
+comp 红包服务 [service] @核心扣减:
+  api: |
+    // GrabHandler 是扣减的唯一入口，四道关卡按「检查越便宜越靠前」排布：
+    func GrabHandler(id, userID, reqID):
+        if localDoneCache.get(id):           // 本地内存里记着「这个红包抢完了」，
+            return ErrEmpty                  // 就直接回「手慢了」，连 Redis 都不用问
+        amt := redis.Eval(LUA, [queue, grabbed], userID)  // 原子扣减（脚本见 Redis 组件）
+        if amt == -1: return ErrGrabbed      // Lua 返回 -1：这个人抢过了
+        if amt == 0:                         // Lua 返回 0：红包抢完了
+            broadcastDone(id)                // 翻转 done 标记，广播到所有实例
+            return ErrEmpty
+        mq.Send(ChargeMsg{id, userID, amt})  // 抢到了：发记账消息，不等落盘结果
+        return amt                           // 全程 <5ms
+  seq: 抢红包核心链路 |
+    用户 -> 网关: POST /grab (red_packet_id, request_id)
+    网关 -> 网关: 令牌桶取一张票（refill=2000/s）
+    网关 --> 用户: 分支：桶空 → 429「人太多，稍后再试」
+    网关 -> 网关: 查本地 done 标记（30s 缓存）
+    网关 --> 用户: 分支：done=true → 「手慢了，红包已抢完」
+    网关 -> 红包服务: 转发扣减请求
+    红包服务 -> 红包服务: 信号量取门票（容量 200，拿不到立刻失败）
+    红包服务 --> 网关: 分支：满负荷 → ErrBusy，网关原样弹回用户
+    红包服务 -> Redis: EVAL Lua：查重+判空+RPOP 扣减+SADD 登记（整段原子）
+    Redis --> 红包服务: -1=已抢过 / 0=已抢完 / amount=3.21
+    红包服务 -> Redis: 分支：LLEN=0 时 SET done=1 并广播给各实例
+    红包服务 -> MQ: send(记账消息)，只发不等——这一步不阻塞返回
+    MQ --> 红包服务: ack（毫秒级）
+    红包服务 --> 网关: { amount: 3.21 }（全程 <5ms）
+    网关 --> 用户: 展示抢到金额
+    MQ -> DB: 消费者攒批 500 条 batch_insert grab_record
+    DB --> MQ: 唯一索引冲突 → ON DUPLICATE 幂等跳过
+    DB -> DB: 定时对账任务：以 DB 为准修复 Redis 侧差异
+
+comp Redis [cache] @核心扣减:
+  lua: |
+    -- 为什么用 Lua：Redis 是单线程执行命令的，一段 Lua 脚本会被当作
+    -- 「一条命令」整段执行完才处理下一条——所以脚本里的四个动作要么全做、
+    -- 要么全不做，并发请求插不进来，这就是原子性的来源。
+    -- KEYS[1]=rp:{id}:queue（预拆金额队列）  KEYS[2]=rp:{id}:grabbed（已抢人集合）
+    -- ARGV[1]=user_id
+    if redis.call('SISMEMBER', KEYS[2], ARGV[1]) == 1 then
+      return -1                       -- 这个人抢过了，拒绝（防重复领取）
+    end
+    if redis.call('LLEN', KEYS[1]) == 0 then
+      return 0                        -- 队列空了，红包抢完了
+    end
+    local amt = redis.call('RPOP', KEYS[1])   -- 弹出一份预拆好的金额
+    redis.call('SADD', KEYS[2], ARGV[1])      -- 把这个用户登记进已抢集合
+    return amt
+  note: |
+    发红包时不按「抢的时候现算金额」，而是发的那一刻就把总金额预拆成 N 份，
+    一次性 LPUSH 进 Redis 队列。拆分用「二倍均值法」：每份金额在
+    (0, 剩余金额÷剩余份数×2) 这个区间里随机——期望值上每份一样大、不会有人
+    抢到 0 元、最后一份拿剩余全部：
+    ```
+    amounts = double_mean_split(total, n)   // 每份 random∈(0, 剩余均值×2)
+    redis.lpush(f"rp:{id}:queue", *amounts)
+    redis.set(f"rp:{id}:done", 0)
+    ```
+    不超发的保证：队列里只有 N 份，RPOP 弹出的次数不可能超过 N。
+
+comp DB [db] @存储与异步:
+  table: |
+    red_packet(id PK, sender_id, total_amount, total_count,
+               status ENUM(INIT,READY,EMPTY,REFUNDED), created_at)
+    grab_record(red_packet_id, user_id, amount, grabbed_at,
+                UNIQUE KEY(red_packet_id, user_id))
+  sql: |
+    -- 发包：预拆分后一次性写入
+    INSERT INTO red_packet VALUES (...) -- status=INIT，预热完转 READY
+    -- 异步落盘（MQ 消费者批量执行）
+    INSERT INTO grab_record VALUES (...)
+    ON DUPLICATE KEY UPDATE amount=amount  -- 幂等兜底
+
+comp MQ [mq] @存储与异步:
+  note: |
+    抢到后的记账/落盘/通知全部异步化。消费者伪代码：
+    ```
+    on_message(msg):
+        rows = buffer.drain(max=500)          // 攒批，500 条一插
+        try: db.batch_insert(rows)
+        except: retry(3) -> dead_letter(msg)  // 失败重试 3 次进死信
+    ```
+    「死信队列」是重试 3 次仍然失败的消息被挪进的单独队列，进死信就触发告警、
+    人工介入，而不是无限重试拖住整个队列。另外有定时对账任务对比 Redis 的
+    grabbed 集合和 DB 的 grab_record 表，发现差异以 DB 为准修复——
+    异步链路不追求每一步都不丢，追求的是「丢了一定能被发现并修回来」。
+
+edge 用户 -> 网关 [1]: 点击抢红包:
+  problems: |
+    【死法一：热点读把 DB 拖死】
+    现象: |
+      100 人的群发一个红包，几秒内上万人点「开」。如果每次点击都穿透到 DB 扣减，
+      所有请求排队抢同一行的行锁，连不发红包的普通用户都打不开页面——整站雪崩。
+    分析: |
+      从监控逐层往下钻。先看接入层：网关 access log 状态码几乎全 200、
+      转发耗时正常，排除网关自身：
+      ```text
+      # 网关 access log（抽样）：
+      # 20:00:01 POST /grab 200 upstream_time=3ms
+      # 20:00:01 POST /grab 200 upstream_time=2ms
+      # 20:00:02 POST /grab 200 upstream_time=4ms    # 状态码和转发耗时都正常
+      ```
+      再看红包服务：handler 耗时 P99 正常，服务自己没干重活，时间花在等下游：
+      ```text
+      # 红包服务 metrics：
+      # handler_duration_p99 = 6ms     ✓ 正常
+      # db_wait_p99          = 4.2s    ← 时间全耗在等 DB
+      ```
+      最后看 DB 监控：QPS 绝对值不算离谱，但「行锁等待」指标打满、活跃连接数
+      顶到上限——锁等待而不是慢查询，这个特征直接指向「大量请求在抢同一行」：
+      ```text
+      # DB 监控（故障时段）：
+      # qps                = 900      # 绝对值不离谱
+      # row_lock_waits     = 880/s    # 几乎每条语句都在等行锁
+      # active_connections = 200/200  # 连接池顶满
+      ```
+      回到原方案代码对上这行锁：
+      ```
+      UPDATE red_packet SET remain = remain - 1 WHERE id = ? AND remain > 0
+      ```
+      病根就是这条 UPDATE。它要拿行锁：InnoDB 对同一行的更新是串行的，
+      单行吞吐只有几百 TPS；而上万的点击里 99% 的结果其实是「手慢了」——
+      这些请求根本不需要碰数据，却和有资格扣减的请求挤在同一条行锁队列里。
+      队列长度一旦超过连接池容量（连接池：网关到 DB 之间预先建好的固定数量
+      连接，来请求借一条、用完归还，借完不还新请求就得排队），新连接建不上，
+      整站雪崩。
+    解法: |
+      候选有三个。
+
+      候选一：SQL 层硬扛——缩短事务、加索引：
+      ```sql
+      BEGIN;
+      UPDATE red_packet SET remain = remain - 1 WHERE id = ? AND remain > 0;  -- 行锁还在
+      INSERT INTO grab_record ...;
+      COMMIT;                        -- 事务再短，同一行的 UPDATE 仍要排队拿锁
+      ```
+      代价：索引救不了行锁串行，单行几百 TPS 是物理上限，加机器只是让更多请求
+      挤进排队队列。
+
+      候选二：库存前置到 Redis，全部点击都打在 Redis 上：
+      ```text
+      remain = redis.Get("rp:{id}:remain")          # 库存挪进 Redis
+      if remain > 0:
+          redis.Decr("rp:{id}:remain")              # 扣减打在 Redis 上，不再碰 DB 行锁
+      ```
+      代价：Redis 主从异步复制，宕机切换有丢数据窗口（见连线 [3]），资损风险直接暴露；
+      且「手慢了」的读请求和真实扣减仍混在一起，没有结构性缓解。
+
+      候选三：把「抢完了吗」这个读问题从写路径上摘出来，在读路径就地回答
+      （选定）：
+      ```
+      // 网关本地缓存（30s）先行短路
+      if localCache["rp:{id}:done"]: return { code: "EMPTY" }
+      ```
+      红包抢完的瞬间翻转 done 标记并广播到各实例，九成以上的迟到请求
+      在这一层结束，根本摸不到 Redis 和 DB。
+
+      选定候选三。理由（成本账）：done 标记让 99% 的无效点击在网关内存里
+      几纳秒结束，DB 只需承接真正有得抢的那几百个请求，行锁队列从「上万」
+      缩到「红包份数」量级；改动只在网关加一层缓存和一次广播，不碰扣减链路
+      本身，实现风险最小。
+
+    【重复点击与网络重试】
+    现象: |
+      同一个用户狂点按钮、或弱网下客户端自动重试，会发出多个相同请求。
+    分析: |
+      如果扣减动作不查重，每个请求都是独立的一次领取：
+      ```
+      amt = redis.rpop(queue)   // 不查重，来几次领几份
+      ```
+      用户领到 3 份意味着别人少领 2 份，这是资损。
+    解法: |
+      扣减前先查重，查重和扣减原子完成（完整 Lua 见 Redis 组件）：
+      ```
+      if redis.call('SISMEMBER', grabbed, user_id) == 1 then return -1 end
+      ```
+      客户端重试复用同一个 request_id，服务端按 request_id 幂等去重。
+
+edge 网关 -> 红包服务 [2]: 转发扣减请求:
+  problems: |
+    【连接池打满】
+    现象: |
+      洪峰时网关开始大量 502，延迟从 5ms 飙到几秒，最后整个网关层不可用。
+    分析: |
+      先确认死法，再找凶手。看网关侧监控：CPU、内存都正常，唯独「活跃连接数」
+      顶到了池子上限——池子借光了，这是第一个证据：
+      ```text
+      # 网关侧监控（故障时段）：
+      # cpu_usage          = 35%      # 正常
+      # mem_usage          = 52%      # 正常
+      # active_connections = 200/200  # 连接池借光，新请求只能排队
+      ```
+      再看红包服务侧：handler 耗时 P99 涨了几百倍，说明服务真的变慢了，
+      不是网关冤枉它：
+      ```text
+      # 红包服务 metrics：
+      # handler_duration_p99{handler="grab"} = 平时 5ms → 故障时 3.2s（涨 600 倍）
+      ```
+      两头证据拼起来：
+      服务变慢 → 每条借出的连接被占得更久 → 池子腾不出连接 → 新请求排队，
+      排队又让延迟更高。先交代背景：网关和红包服务之间不是每来一个请求就
+      新建一条 TCP 连接（建连接要三次握手，太慢），而是维护一个「连接池」——
+      预先建好固定数量的连接放在池子里，来请求借一条、用完归还；池子借光了，
+      新请求只能排队等别人还。回到代码看连接是怎么借出去的：
+      ```
+      // 借一条连接发请求，最多等 30 秒；这期间这条连接一直归这个请求占用
+      resp = http.Post(svc, body, timeout=30s)
+      ```
+      病根是 timeout=30s：洪峰时红包服务变慢，每个在途请求都占着一条连接
+      不撒手，最多 30 秒，池子迅速借光。接下来是正反馈回路：新请求排队 →
+      排队拉高整体延迟 → 延迟高意味着每条连接占用更久 → 池子更难腾出连接，
+      几秒钟之内整个网关层全灭。
+    解法: |
+      候选有三个。
+
+      候选一：扩大连接池（200 → 2000）：
+      ```text
+      http_client := NewClient(pool_size=2000, timeout=30s)   # 只改这一个数字
+      ```
+      代价：池子越大，服务侧同时被压住
+      的请求越多，雪崩只是把崩溃点从网关挪到服务侧；更多连接还意味着更多
+      内存和文件句柄，治标不治本。
+
+      候选二：服务侧快速失败——处理不了就当场拒绝，让连接几毫秒内归还，
+      绝不让请求占着连接排队（选定）。用信号量（semaphore）限制同时在处理
+      的请求数：
+      ```
+      // sem 是一个容量 200 的 Go channel，充当「门票」：
+      // channel 里最多同时存在 200 个值，代表最多 200 个请求同时在处理。
+      // select + default 是 Go 的「非阻塞尝试」语法：
+      // case 走不通时不等待，立刻走 default 分支。
+      func GrabHandler(...):
+          select {
+          case sem <- 1:                 // 往 channel 塞进一个值 = 领到一张门票
+              defer func() { <-sem }()   // 函数结束时取出 = 归还门票
+              ...正常走 Lua 扣减逻辑
+          default:                       // 塞不进去 = 200 张门票发完了
+              return ErrBusy             // 立刻回「系统繁忙」，全程不到 1ms
+          }
+      ```
+      跟着一个请求走一遍：进来先尝试往 sem 塞值——塞得进，说明在处理的请求
+      还不到 200 个，正常处理、处理完归还；塞不进，说明服务已满负荷，这个请求
+      立刻收到 ErrBusy，不排队、不占网关连接。200 的口径来自单机压测的稳定并发数。
+      配合 done 标记短路（见连线 [1]），多数请求甚至到不了这一层。
+
+      候选三：调用方加熔断器（连续失败率超阈值就自动切断调用，过段时间再试）：
+      ```text
+      if breaker.FailureRate() > 0.5:          # 失败率过半
+          breaker.Open()                       # 直接切断调用，请求快速失败
+          time.Sleep(30s); breaker.HalfOpen()  # 半开试探，恢复后关闭
+      ```
+      代价：熔断期间所有请求直接失败，用户体验是「抢不了」；它适合做兜底的
+      第二道防线，单独使用等于主动放弃可用性。
+
+      选定候选二。理由（成本账）：拒绝一个请求的成本不到 1ms，连接立刻归还，
+      池子永不枯竭；而容量 200 来自单机压测的稳定并发数，超出的请求本来就
+      处理不完，快速失败只是承认这个事实，把「排队等一个注定超时的结果」
+      换成「立刻告诉用户稍后再试」。
+
+edge 红包服务 -> Redis [3]: Lua 原子扣减:
+  problems: |
+    【死法二：超发资损】
+    现象: |
+      100 个红包实际发出 105 份，真金白银的资损。
+    分析: |
+      原方案把检查和扣减拆成两步：
+      ```
+      remain = redis.llen(queue)       // 第一步：查
+      if remain > 0: redis.rpop(queue) // 第二步：扣
+      ```
+      两个并发请求同时执行到第一步，都看到 remain=1，都通过检查、各领一份。
+      Redis 是单线程，但「单线程」只保证每条命令原子，不保证「两条命令的组合」原子——
+      病根是把一个业务不变式（份数不超发）寄托在了两条独立的命令上。
+    解法: |
+      把校验、扣减、登记打包成一段 Lua，Redis 单线程执行整段脚本，天然原子
+      （完整脚本见 Redis 组件）：
+      ```
+      if SISMEMBER grabbed user then return -1 end   -- 防重
+      if LLEN queue == 0 then return 0 end           -- 防超发
+      amt = RPOP queue; SADD grabbed user            -- 扣减+登记
+      ```
+      四个动作不可分割，并发请求只能整段排队执行，不变式恢复成立。
+
+    【主从切换丢数据】
+    现象: |
+      Redis 主节点宕机切换到从库后，个别用户重复抢到了红包。
+    分析: |
+      Redis 主从复制是异步的：主节点写入 grabbed 集合后、同步到从库前宕机，
+      这批写入就丢了。从库顶上来后 grabbed 里没有这些用户，他们能再抢一次。
+      靠 Redis 自身做强一致要牺牲可用性和延迟：
+      ```
+      WAIT 1 100   -- 等 1 个从库确认，超时 100ms——洪峰下大量超时失败
+      ```
+      这条路的代价洪峰期扛不住，不值。
+    解法: |
+      内存层不追求完美，DB 层兜底：grab_record 表加唯一索引，重复写入直接冲突：
+      ```
+      grab_record(..., UNIQUE KEY(red_packet_id, user_id))
+      INSERT ... ON DUPLICATE KEY UPDATE amount=amount   -- 幂等
+      ```
+      再配定时对账任务，以 DB 为准修复两边差异。
+
+edge 红包服务 -> MQ [4]: 记账落盘消息:
+  problems: |
+    【权衡：一致性 vs 体感】
+    现象: |
+      大促时 DB 抖动，用户抢到红包后转圈几百毫秒才看到结果。
+    分析: |
+      原方案同步落盘再返回：
+      ```
+      amt = redis.rpop(queue)
+      db.insert(grab_record)          // 同步等 DB
+      return amt
+      ```
+      DB 的任何抖动都直接传导到用户体感——而抢红包场景里，
+      一致性只对记账重要，体感对用户重要，两者被绑在了一起。
+    解法: |
+      解绑：内存扣成功即返回，落盘走 MQ 异步：
+      ```
+      mq.Send(ChargeMsg{...})   // 不等落盘
+      return amt                // <5ms
+      ```
+      代价是 Redis 崩溃且主从都丢数据时，会出现「用户看到抢到、库里没记录」。
+      为什么值得：金额差异可以用 DB 唯一索引 + 对账事后修复（见连线 [3]），
+      但卡三秒的体感没法补救——红包场景下前者是账，后者是命。
+
+    【MQ 堆积】
+    现象: |
+      洪峰时消费者跟不上，落盘延迟从毫秒拉到分钟级，用户余额迟迟不变。
+    分析: |
+      消费者逐条 INSERT 的吞吐远低于洪峰生产速率，消息在队列里越堆越多：
+      ```
+      on_message(msg): db.insert(msg)   // 逐条插，~2k TPS 顶不住
+      ```
+      堆积本身不丢数据（MQ 持久化），但延迟拉大让「余额不一致」的窗口变长。
+    解法: |
+      消费端攒批，把逐条插入改成批量插入提升吞吐：
+      ```
+      rows = buffer.drain(max=500)
+      db.batch_insert(rows)      // 500 条一插
+      ```
+      失败重试 3 次进死信队列告警，对账任务兜住最终一致。
